@@ -7,7 +7,7 @@
 </svg>
 
 # 🎯 BUG BOUNTY BOOTCAMP
-### `0x3bedo` // *THINK BEYOND THE SYSTEM.*
+### `0x3bdo` // *THINK BEYOND THE SYSTEM.*
 
 **A hands-on offensive security companion to Vickie Li's *Bug Bounty Bootcamp* — bridging extended Notion research, custom vibe-coded vulnerable labs, exploitation writeups, and automation tools.**
 
